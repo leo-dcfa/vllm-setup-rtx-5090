@@ -10,22 +10,32 @@ served-model-name answers, so a client addresses whichever model is up.
 
 ## Models
 
-| Served model name | HF repo | Quant | Start ctx | Weights |
+| Served model name | HF repo | Quant | Start ctx | Weights (loaded) |
 |---|---|---|---|---|
-| `qwen3.6-27b`     | `nvidia/Qwen3.6-27B-NVFP4`      | NVFP4 (4-bit FP) | 262144 | ~14 GB |
-| `qwen3.6-35b-a3b` | `nvidia/Qwen3.6-35B-A3B-NVFP4`  | NVFP4 (4-bit FP) | 262144 | ~17 GB |
-| `gemma4-26b`      | `nvidia/Gemma-4-26B-A4B-NVFP4`  | NVFP4 (4-bit FP) | 131072 | ~16.5 GB |
+| `qwen3.6-27b`     | `nvidia/Qwen3.6-27B-NVFP4`      | NVFP4 (mixed FP4/FP8) | 131072 | ~20 GB |
+| `qwen3.6-35b-a3b` | `nvidia/Qwen3.6-35B-A3B-NVFP4`  | NVFP4 (mixed FP4/FP8) | 131072 | ~20 GB |
+| `gemma4-26b`      | `nvidia/Gemma-4-26B-A4B-NVFP4`  | NVFP4 (mixed FP4/FP8) | 65536  | ~17 GB |
 
-Native max is 262144 for all three. vLLM fails **at startup** if KV won't fit —
-just lower `--max-model-len` in the Makefile and re-run. `--kv-cache-dtype fp8`
-(near-lossless on Blackwell) is on everywhere to roughly double KV headroom.
+These are **conservative starting** context sizes for a 32 GB card. vLLM fails
+**at startup** with a CUDA OOM if the KV cache won't fit — the fix is to lower
+`--max-model-len` in the Makefile. After a model boots, `make logs` prints the
+actual `GPU KV cache size` in tokens; raise `--max-model-len` toward that if you
+want more. `--kv-cache-dtype fp8` is on everywhere to ~double KV headroom.
 
-**Quant rationale (32 GB Blackwell):** NVFP4 is a 4-bit *float* format with
-two-level block scaling, run on the RTX 5090's native FP4 tensor cores — "BF16
-accuracy at INT4 density" (~2% eval degradation, ~1.6× faster than BF16, ~1.3×
-faster than INT4/GPTQ). Unlike INT4 (GPTQ/AWQ), it's near-lossless. Halving the
-weights vs. FP8 means all three now fit with **full-length context** on a single
-32 GB card. Requires a Blackwell-capable vLLM image (see below).
+**Notes on these NVFP4 checkpoints (learned the hard way):**
+- They're **multimodal** — the vision tower adds several GB. The targets pass
+  `--language-model-only` to drop it (text-only; fine for coding). Remove that
+  flag if you need image input, but then you must shrink `--max-model-len`.
+- They're **mixed precision** (`ModelOptFp8LinearMethod` on some layers), so they
+  load at ~20 GB, not the ~14 GB a pure-4-bit 27B would. That's what forces the
+  context down from the native 262144.
+- On the RTX 5090, vLLM currently runs these **weight-only via the Marlin kernel**
+  (`GPU does not have native support for FP4`) rather than native FP4 tensor cores
+  — correct results, slightly below peak throughput.
+
+**Quant rationale:** NVFP4 is a 4-bit *float* format with two-level block scaling
+(~2% eval degradation, near-lossless vs. INT4). It needs a Blackwell cu130 vLLM
+image (see below); the default cu129 image fails NVFP4 engine init on sm_120.
 
 ## Prerequisites (one time, needs sudo)
 

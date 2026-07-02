@@ -1,43 +1,49 @@
-# vLLM model lifecycle — rtx-5090-linux (single RTX 5090, 32 GB)
+# vLLM model lifecycle — rtx-5090-linux (single RTX 5090, 32 GB), Docker (cu130)
 #
-# ONE model is loaded at a time (single GPU). Every `up-*` target first tears
-# down whatever is running, then starts the requested model as a Docker
-# container named `vllm`, serving an OpenAI-compatible API on 127.0.0.1:8000.
-# All three targets publish to this one endpoint; only the currently-loaded
-# served-model-name answers, so a client addresses whichever model is up.
+# Runs vLLM in Docker using the Blackwell cu130 image, which ships PREBUILT
+# sm_120 NVFP4/FlashInfer kernels — so there is NO runtime JIT compilation
+# (the venv path failed to JIT-build the sm120 GEMM: nvcc/ninja/CCCL mismatch).
+# ONE model at a time (single 32 GB GPU): every `up-*` target stops whatever is
+# running, then launches a container serving an OpenAI-compatible API on
+# 127.0.0.1:8000.
 #
-#   make up-qwen3.6-27b        # dense 27B, FP8
-#   make up-qwen3.6-35b-a3b    # 35B MoE, GPTQ-Int4
-#   make up-gemma4-26b         # 26B MoE, FP8-dynamic
+#   make up-qwen3.6-27b        # dense 27B, NVFP4
+#   make up-qwen3.6-35b-a3b    # 35B MoE, NVFP4
+#   make up-gemma4-26b         # 26B MoE, NVFP4
 #   make down                  # stop + free the GPU
-#   make logs / ps / status    # observe
+#   make logs / status / health
 #
-# First start of a model downloads weights into the `vllm-hf` docker volume
-# (tens of GB) — watch `make logs` until you see "Application startup complete".
+# Image is pinned via VLLM_IMAGE in .env (default below); the cu129/:latest image
+# fails NVFP4 engine init on sm_120, so use a cu130 tag. HF weights are shared
+# from the host cache (~/.cache/huggingface) so models download only once.
+# Prereq: Docker + NVIDIA Container Toolkit (already set up on this box).
 
-SHELL      := /usr/bin/env bash
-CONTAINER  := vllm
-PORT       := 8000
-HF_VOLUME  := vllm-hf
+SHELL     := /usr/bin/env bash
+PORT      := 8000
+NAME      := vllm-local
+IMAGE     := vllm/vllm-openai:gemma4-0505-cu130   # override with VLLM_IMAGE in .env
+HF_CACHE  := $(HOME)/.cache/huggingface
+ENV_FILE  := $(CURDIR)/.env
 
-# Blackwell (sm_120) needs a recent CUDA 12.8+/13.0 build. Override in .env if you
-# pin a specific tag. Gemma 4 needs the dedicated build that ships its kernels.
-VLLM_IMAGE  ?= vllm/vllm-openai:latest
-GEMMA_IMAGE ?= vllm/vllm-openai:gemma4-0505-cu130
+# Common flags every model shares. --host 0.0.0.0 inside the container; the port
+# is published to 127.0.0.1 on the host, so it stays local-only.
+SERVE_COMMON = --host 0.0.0.0 --port $(PORT) --kv-cache-dtype fp8 --enable-prefix-caching
 
-# .env holds HF_TOKEN (for gated repos) and any *_IMAGE overrides. Optional.
-ENV_FILE := $(CURDIR)/.env
-ENV_ARG  := $(if $(wildcard $(ENV_FILE)),--env-file $(ENV_FILE),)
-
-# Common docker run flags. Port bound to loopback only — front with a proxy if remote.
-DOCKER_RUN = docker run -d --name $(CONTAINER) --restart unless-stopped \
-	--gpus all --ipc=host \
-	-p 127.0.0.1:$(PORT):8000 \
-	-v $(HF_VOLUME):/root/.cache/huggingface \
-	$(ENV_ARG)
-
-# Flags shared by every vLLM invocation.
-SERVE_COMMON = --host 0.0.0.0 --enable-prefix-caching
+# $(call serve,<model>,<served-name>,<extra flags>)
+define serve
+	@$(MAKE) --no-print-directory down
+	@set -a; [ -f $(ENV_FILE) ] && . $(ENV_FILE); set +a; \
+	IMG=$${VLLM_IMAGE:-$(IMAGE)}; \
+	echo "→ $(2) starting in Docker ($$IMG). Weights load from host HF cache — follow: make logs"; \
+	docker run -d --name $(NAME) --gpus all --ipc=host --restart unless-stopped \
+	  -p 127.0.0.1:$(PORT):$(PORT) \
+	  -v $(HF_CACHE):/root/.cache/huggingface \
+	  $${HF_TOKEN:+-e HF_TOKEN=$$HF_TOKEN} \
+	  $$IMG \
+	  $(1) --served-model-name $(2) $(SERVE_COMMON) $(3) >/dev/null \
+	  && echo "→ container $(NAME) started (pid inside docker)" \
+	  || echo "→ docker run failed"
+endef
 
 .DEFAULT_GOAL := help
 
@@ -46,61 +52,38 @@ SERVE_COMMON = --host 0.0.0.0 --enable-prefix-caching
 ## ----------------------------------------------------------------------------
 
 .PHONY: up-qwen3.6-27b
-up-qwen3.6-27b: down ## dense 27B — nvidia/Qwen3.6-27B-NVFP4
-	$(DOCKER_RUN) $(VLLM_IMAGE) \
-	  --model nvidia/Qwen3.6-27B-NVFP4 \
-	  --served-model-name qwen3.6-27b \
-	  --max-model-len 262144 \
-	  --gpu-memory-utilization 0.90 \
-	  --kv-cache-dtype fp8 \
-	  --reasoning-parser qwen3 \
-	  $(SERVE_COMMON)
-	@echo "→ qwen3.6-27b starting. Follow: make logs"
+up-qwen3.6-27b: ## dense 27B — cyankiwi/Qwen3.6-27B-AWQ-INT4 (~14GB; NVFP4 OOMs in this image)
+	$(call serve,cyankiwi/Qwen3.6-27B-AWQ-INT4,qwen3.6-27b,--max-model-len 65536 --gpu-memory-utilization 0.85 --reasoning-parser qwen3 --language-model-only --enforce-eager --enable-auto-tool-choice --tool-call-parser qwen3_xml)
 
 .PHONY: up-qwen3.6-35b-a3b
-up-qwen3.6-35b-a3b: down ## 35B MoE — nvidia/Qwen3.6-35B-A3B-NVFP4
-	$(DOCKER_RUN) $(VLLM_IMAGE) \
-	  --model nvidia/Qwen3.6-35B-A3B-NVFP4 \
-	  --served-model-name qwen3.6-35b-a3b \
-	  --max-model-len 262144 \
-	  --gpu-memory-utilization 0.92 \
-	  --kv-cache-dtype fp8 \
-	  --reasoning-parser qwen3 \
-	  $(SERVE_COMMON)
-	@echo "→ qwen3.6-35b-a3b starting. Follow: make logs"
+up-qwen3.6-35b-a3b: ## 35B MoE — nvidia/Qwen3.6-35B-A3B-NVFP4
+	$(call serve,nvidia/Qwen3.6-35B-A3B-NVFP4,qwen3.6-35b-a3b,--max-model-len 131072 --gpu-memory-utilization 0.92 --reasoning-parser qwen3 --language-model-only --enable-auto-tool-choice --tool-call-parser hermes)
 
 .PHONY: up-gemma4-26b
-up-gemma4-26b: down ## 26B MoE — nvidia/Gemma-4-26B-A4B-NVFP4
-	$(DOCKER_RUN) $(GEMMA_IMAGE) \
-	  --model nvidia/Gemma-4-26B-A4B-NVFP4 \
-	  --served-model-name gemma4-26b \
-	  --max-model-len 131072 \
-	  --gpu-memory-utilization 0.90 \
-	  --kv-cache-dtype fp8 \
-	  $(SERVE_COMMON)
-	@echo "→ gemma4-26b starting. Follow: make logs"
+up-gemma4-26b: ## 26B MoE — nvidia/Gemma-4-26B-A4B-NVFP4
+	$(call serve,nvidia/Gemma-4-26B-A4B-NVFP4,gemma4-26b,--max-model-len 65536 --gpu-memory-utilization 0.90 --language-model-only --enable-auto-tool-choice --tool-call-parser gemma4)
 
 ## ----------------------------------------------------------------------------
 ## Lifecycle / observability
 ## ----------------------------------------------------------------------------
 
 .PHONY: down
-down: ## Stop and remove the vLLM container (frees the GPU)
-	@docker rm -f $(CONTAINER) >/dev/null 2>&1 && echo "→ stopped $(CONTAINER)" || echo "→ nothing running"
+down: ## Stop + remove the running vLLM container (frees the GPU)
+	@docker rm -f $(NAME) >/dev/null 2>&1 && echo "→ stopped $(NAME)" || echo "→ nothing running"
 
 .PHONY: logs
-logs: ## Follow container logs
-	docker logs -f $(CONTAINER)
-
-.PHONY: ps
-ps: ## Show the vLLM container
-	@docker ps --filter name=$(CONTAINER) --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+logs: ## Follow the container log
+	@docker logs -f $(NAME)
 
 .PHONY: status
-status: ## Show loaded model + GPU usage
-	@echo "== container ==";  docker ps --filter name=$(CONTAINER) --format '{{.Names}}\t{{.Status}}' || true
-	@echo "== served model =="; curl -s http://127.0.0.1:$(PORT)/v1/models | (command -v jq >/dev/null && jq -r '.data[].id' || cat) || echo "(endpoint not up)"
-	@echo "== gpu =="; nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
+status: ## Show running container + served model + GPU usage
+	@docker ps --filter name=$(NAME) --format '  container: {{.Names}}  {{.Status}}' | grep . || echo "  container: not running"
+	@echo "served model:"; curl -s -m 5 http://127.0.0.1:$(PORT)/v1/models | (command -v jq >/dev/null && jq -r '.data[].id' || cat) 2>/dev/null || echo "  (endpoint not up)"
+	@echo "gpu:"; nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
+
+.PHONY: health
+health: ## One-shot health check (HTTP code)
+	@curl -s -m 5 -o /dev/null -w "health: %{http_code}\n" http://127.0.0.1:$(PORT)/health
 
 .PHONY: help
 help: ## List targets
