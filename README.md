@@ -12,9 +12,9 @@ served-model-name answers, so a client addresses whichever model is up.
 
 | Served model name | HF repo | Quant | Start ctx | Weights (loaded) |
 |---|---|---|---|---|
-| `qwen3.6-27b`     | `nvidia/Qwen3.6-27B-NVFP4`      | NVFP4 (mixed FP4/FP8) | 131072 | ~20 GB |
+| `qwen3.6-27b`     | `cyankiwi/Qwen3.6-27B-AWQ-INT4` | AWQ INT4              | 131072 | ~14 GB |
 | `qwen3.6-35b-a3b` | `nvidia/Qwen3.6-35B-A3B-NVFP4`  | NVFP4 (mixed FP4/FP8) | 131072 | ~20 GB |
-| `gemma4-26b`      | `nvidia/Gemma-4-26B-A4B-NVFP4`  | NVFP4 (mixed FP4/FP8) | 65536  | ~17 GB |
+| `gemma4-26b`      | `nvidia/Gemma-4-26B-A4B-NVFP4`  | NVFP4 (mixed FP4/FP8) | 131072 | ~17 GB |
 
 These are **conservative starting** context sizes for a 32 GB card. vLLM fails
 **at startup** with a CUDA OOM if the KV cache won't fit — the fix is to lower

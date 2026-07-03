@@ -53,7 +53,7 @@ endef
 
 .PHONY: up-qwen3.6-27b
 up-qwen3.6-27b: ## dense 27B — cyankiwi/Qwen3.6-27B-AWQ-INT4 (~14GB; NVFP4 OOMs in this image)
-	$(call serve,cyankiwi/Qwen3.6-27B-AWQ-INT4,qwen3.6-27b,--max-model-len 65536 --gpu-memory-utilization 0.85 --reasoning-parser qwen3 --language-model-only --enforce-eager --enable-auto-tool-choice --tool-call-parser qwen3_xml)
+	$(call serve,cyankiwi/Qwen3.6-27B-AWQ-INT4,qwen3.6-27b,--max-model-len 131072 --gpu-memory-utilization 0.85 --reasoning-parser qwen3 --language-model-only --enforce-eager --enable-auto-tool-choice --tool-call-parser qwen3_xml)
 
 .PHONY: up-qwen3.6-35b-a3b
 up-qwen3.6-35b-a3b: ## 35B MoE — nvidia/Qwen3.6-35B-A3B-NVFP4
@@ -61,7 +61,7 @@ up-qwen3.6-35b-a3b: ## 35B MoE — nvidia/Qwen3.6-35B-A3B-NVFP4
 
 .PHONY: up-gemma4-26b
 up-gemma4-26b: ## 26B MoE — nvidia/Gemma-4-26B-A4B-NVFP4
-	$(call serve,nvidia/Gemma-4-26B-A4B-NVFP4,gemma4-26b,--max-model-len 65536 --gpu-memory-utilization 0.90 --language-model-only --enable-auto-tool-choice --tool-call-parser gemma4)
+	$(call serve,nvidia/Gemma-4-26B-A4B-NVFP4,gemma4-26b,--max-model-len 131072 --gpu-memory-utilization 0.90 --language-model-only --enable-auto-tool-choice --tool-call-parser gemma4)
 
 ## ----------------------------------------------------------------------------
 ## Lifecycle / observability
