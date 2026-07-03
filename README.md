@@ -10,32 +10,47 @@ served-model-name answers, so a client addresses whichever model is up.
 
 ## Models
 
-| Served model name | HF repo | Quant | Start ctx | Weights (loaded) |
+| Served model name | HF repo | Quant | Max ctx | Weights (loaded) |
 |---|---|---|---|---|
-| `qwen3.6-27b`     | `cyankiwi/Qwen3.6-27B-AWQ-INT4` | AWQ INT4              | 131072 | ~14 GB |
-| `qwen3.6-35b-a3b` | `nvidia/Qwen3.6-35B-A3B-NVFP4`  | NVFP4 (mixed FP4/FP8) | 131072 | ~20 GB |
-| `gemma4-26b`      | `nvidia/Gemma-4-26B-A4B-NVFP4`  | NVFP4 (mixed FP4/FP8) | 131072 | ~17 GB |
+| `qwen3.6-27b`     | `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` | NVFP4 (pure `modelopt_fp4`, text-only) | 196608 | ~17.6 GB |
+| `gemma4-26b`      | `nvidia/Gemma-4-26B-A4B-NVFP4`             | NVFP4 (`modelopt_fp4`)                 | 262144 | ~17 GB |
 
-These are **conservative starting** context sizes for a 32 GB card. vLLM fails
-**at startup** with a CUDA OOM if the KV cache won't fit — the fix is to lower
-`--max-model-len` in the Makefile. After a model boots, `make logs` prints the
-actual `GPU KV cache size` in tokens; raise `--max-model-len` toward that if you
-want more. `--kv-cache-dtype fp8` is on everywhere to ~double KV headroom.
+Both run the **native** FlashInfer-CUTLASS FP4 path on the RTX 5090 and are
+verified serving coherent output. `--kv-cache-dtype fp8` is on everywhere to
+~double KV headroom. gemma4 uses sliding-window attention (cheap KV) so it holds
+full **256K**; the 27B is a hybrid Mamba model measured at **192K** (1.14×
+concurrency — a full 196608-token request fits). To go higher/lower, adjust
+`--max-model-len`; if a boot fails with `... larger than the maximum number of
+tokens that can be stored in KV cache (N)`, set it to `N`.
 
-**Notes on these NVFP4 checkpoints (learned the hard way):**
-- They're **multimodal** — the vision tower adds several GB. The targets pass
-  `--language-model-only` to drop it (text-only; fine for coding). Remove that
-  flag if you need image input, but then you must shrink `--max-model-len`.
-- They're **mixed precision** (`ModelOptFp8LinearMethod` on some layers), so they
-  load at ~20 GB, not the ~14 GB a pure-4-bit 27B would. That's what forces the
-  context down from the native 262144.
-- On the RTX 5090, vLLM currently runs these **weight-only via the Marlin kernel**
-  (`GPU does not have native support for FP4`) rather than native FP4 tensor cores
-  — correct results, slightly below peak throughput.
+> The 35B (`qwen3.6-35b-a3b`) target was **dropped** — see the commented block in
+> the Makefile. The `nvidia/` checkpoint OOMs at ~30 GB on this card, and it's
+> redundant next to the 27B + gemma4. It *can* run via `RedHatAI/...` at ~96K if
+> you ever want it back (restore recipe is in the Makefile).
+
+**Notes on NVFP4 on this box (learned the hard way):**
+- **Native FP4 needs a current image.** On a current `cu130-nightly` build vLLM
+  recognizes sm_120 and runs the native **FlashInfer-CUTLASS FP4** path (real FP4
+  tensor cores). The old `gemma4-0505-cu130` tag fell back to the **Marlin** kernel
+  (`GPU does not have native support for FP4`) — weight-only dequant, no FP4 FLOPS,
+  plus a *negative-scale* bug that could emit empty/gibberish tokens. That fallback
+  is the "NVFP4 issue" people warn about; the fix is the image, not a flag.
+- **Pick pure `modelopt_fp4`, not `modelopt_mixed`.** The `nvidia/` 27B & 35B
+  checkpoints are `modelopt_mixed` (vision tower + lm_head in BF16). On this build
+  they load at ~30 GB and OOM on 32 GB *regardless* of context/util — the vision
+  BF16 weights don't shed. The text-only pure-FP4 27B loads at 17.6 GB and fits
+  with 192K. gemma4 is pure `modelopt_fp4` and Just Works.
+- **Hybrid Mamba models need two flags.** The 27B (and 35B) are hybrid attention +
+  Mamba/SSM. `--max-num-seqs 2` is load-bearing: the SSM state cache is sized by
+  max-num-seqs (×48 layers) and is *not* gated by `--gpu-memory-utilization`, so the
+  default (~1024) alone eats ~10 GB and OOMs. `--max-num-batched-tokens 8192` bounds
+  the profiling pass (a Mamba assertion / OOM without it when fp8 KV cache is on).
 
 **Quant rationale:** NVFP4 is a 4-bit *float* format with two-level block scaling
-(~2% eval degradation, near-lossless vs. INT4). It needs a Blackwell cu130 vLLM
-image (see below); the default cu129 image fails NVFP4 engine init on sm_120.
+(~2% eval degradation, near-lossless vs. INT4). There is no fast 6-bit path in
+vLLM (MXFP6 is research-grade, GGUF Q6 is slow/unaccelerated); the real step up
+from NVFP4 is FP8, which costs most of your context on 32 GB. It needs a current
+Blackwell `cu130-nightly` image with the sm_120 FP4 kernels.
 
 ## Prerequisites (one time, needs sudo)
 
@@ -85,15 +100,23 @@ OpenAI-compatible gateway or reverse proxy rather than exposing the port directl
 
 ## Tuning knobs
 
-- **More/less context** → adjust `--max-model-len`. If startup OOMs on KV, lower it.
+- **More/less context** → adjust `--max-model-len`. If startup fails on KV, the
+  error names the exact token ceiling that fits; set `--max-model-len` to it.
+- **Confirm native FP4** → `make logs` should **not** print `GPU does not have
+  native support for FP4` or `NVFP4 Marlin ... negative scales`. If it does,
+  you're on an old image — bump `VLLM_IMAGE` to a current `cu130-nightly`.
+- **Faster cold starts** → the torch.compile cache is persisted at `~/.cache/vllm`
+  (mounted into the container), so the ~40s compile only happens on the first
+  launch of each model/flag combo. KV-cache profiling still runs each boot.
 - **Max quality on the 27B** → swap the repo to `Qwen/Qwen3.6-27B-FP8` (8-bit,
   ~28 GB) for the absolute quality ceiling, at the cost of context (~32–64K).
-- **NVFP4 not auto-detected** → if vLLM doesn't pick up the format, add
-  `--quantization modelopt_fp4` to the target.
-- **Blackwell image** → NVFP4 needs a recent build (the `gemma4-0505-cu130` tag or
-  a current `cu128`+ image). Pin via `VLLM_IMAGE` / `GEMMA_IMAGE` in `.env`.
-- **Save VRAM (text-only)** → add `--language-model-only` to the Qwen targets to
-  skip the vision encoder.
+- **NVFP4 not auto-detected** → vLLM reads the format from `config.json`; do
+  **not** pass `--quantization`. Only if detection fails, add
+  `--quantization modelopt_fp4`.
+- **Blackwell image** → native sm_120 NVFP4 needs a current build. Use
+  `vllm/vllm-openai:cu130-nightly`; pin via `VLLM_IMAGE` in `.env`.
+- **Save VRAM (text-only)** → `--language-model-only` (already on) skips the
+  vision encoder; dropping it enables image input but costs context.
 
 ## Files
 
