@@ -12,16 +12,25 @@ served-model-name answers, so a client addresses whichever model is up.
 
 | Served model name | HF repo | Quant | Max ctx | Weights (loaded) |
 |---|---|---|---|---|
-| `qwen3.6-27b`     | `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` | NVFP4 (pure `modelopt_fp4`, text-only) | 196608 | ~17.6 GB |
-| `gemma4-26b`      | `nvidia/Gemma-4-26B-A4B-NVFP4`             | NVFP4 (`modelopt_fp4`)                 | 262144 | ~17 GB |
+| `qwen3.6-27b`     | `unsloth/Qwen3.6-27B-NVFP4`    | FP8 attn/head + NVFP4 MLP (`compressed-tensors`), MTP spec decode | 131072 | ~23 GB |
+| `gemma4-26b`      | `nvidia/Gemma-4-26B-A4B-NVFP4` | NVFP4 (`modelopt_fp4`)                                            | 262144 | ~17 GB |
 
 Both run the **native** FlashInfer-CUTLASS FP4 path on the RTX 5090 and are
 verified serving coherent output. `--kv-cache-dtype fp8` is on everywhere to
-~double KV headroom. gemma4 uses sliding-window attention (cheap KV) so it holds
-full **256K**; the 27B is a hybrid Mamba model measured at **192K** (1.14×
-concurrency — a full 196608-token request fits). To go higher/lower, adjust
-`--max-model-len`; if a boot fails with `... larger than the maximum number of
-tokens that can be stored in KV cache (N)`, set it to `N`.
+~double KV headroom (the Unsloth quant is explicitly calibrated for fp8 KV).
+gemma4 uses sliding-window attention (cheap KV) so it holds full **256K**; the
+27B serves **128K** (1.35× concurrency) with a measured per-request ceiling of
+**137,600** tokens at util 0.94 (vs only ~99K at util 0.90 — the extra 4% is
+load-bearing). Don't read the "GPU KV cache size: 177K tokens" log line as
+context: on hybrid Mamba models the state pages share that pool, so
+pool-tokens ≠ max-model-len. To go higher/lower, adjust `--max-model-len`; if
+a boot fails, the error names the exact ceiling that fits — set it to that.
+
+The 27B is the **Unsloth quant** (2026-07-10): attention + lm_head in FP8, MLPs
+in NVFP4, with the checkpoint's (fixed) MTP head enabled as its own speculative
+draft (`--speculative-config mtp`, ~1.4–2.2× decode). It replaced
+`sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` (pure FP4, ~17.6 GB, reached 192K) —
+better quality and speed for ~32K less context.
 
 > The 35B (`qwen3.6-35b-a3b`) target was **dropped** — see the commented block in
 > the Makefile. The `nvidia/` checkpoint OOMs at ~30 GB on this card, and it's
@@ -29,17 +38,24 @@ tokens that can be stored in KV cache (N)`, set it to `N`.
 > you ever want it back (restore recipe is in the Makefile).
 
 **Notes on NVFP4 on this box (learned the hard way):**
-- **Native FP4 needs a current image.** On a current `cu130-nightly` build vLLM
-  recognizes sm_120 and runs the native **FlashInfer-CUTLASS FP4** path (real FP4
-  tensor cores). The old `gemma4-0505-cu130` tag fell back to the **Marlin** kernel
-  (`GPU does not have native support for FP4`) — weight-only dequant, no FP4 FLOPS,
-  plus a *negative-scale* bug that could emit empty/gibberish tokens. That fallback
-  is the "NVFP4 issue" people warn about; the fix is the image, not a flag.
-- **Pick pure `modelopt_fp4`, not `modelopt_mixed`.** The `nvidia/` 27B & 35B
-  checkpoints are `modelopt_mixed` (vision tower + lm_head in BF16). On this build
-  they load at ~30 GB and OOM on 32 GB *regardless* of context/util — the vision
-  BF16 weights don't shed. The text-only pure-FP4 27B loads at 17.6 GB and fits
-  with 192K. gemma4 is pure `modelopt_fp4` and Just Works.
+- **Native FP4 needs a current image — and "current" rots silently.** On a
+  current `nightly` build vLLM recognizes sm_120 and runs the native
+  **FlashInfer-CUTLASS FP4** path (real FP4 tensor cores). The old
+  `gemma4-0505-cu130` tag fell back to the **Marlin** kernel (`GPU does not have
+  native support for FP4`) — weight-only dequant, no FP4 FLOPS, plus a
+  *negative-scale* bug that could emit empty/gibberish tokens. That fallback is
+  the "NVFP4 issue" people warn about; the fix is the image, not a flag.
+  **Two traps found 2026-07:** (a) the upstream `cu130-nightly` tag is dead —
+  frozen at 2026-04-23; the rolling tag is now plain `nightly`; (b) docker never
+  re-pulls a tag it has cached, so run `make pull` before expecting new-model
+  support (symptom of a stale image: weight-load failure like
+  `no module or parameter named 'lm_head.weight_scale'`).
+- **Not all "mixed" quants are equal.** The `nvidia/` 27B & 35B checkpoints are
+  `modelopt_mixed` (vision tower + lm_head in **BF16**). On this build they load at
+  ~30 GB and OOM on 32 GB *regardless* of context/util — the vision BF16 weights
+  don't shed. The Unsloth 27B is also mixed, but the mix is FP8 attention/head +
+  NVFP4 MLPs (compressed-tensors), so everything big is quantized and it fits
+  (~23 GB). gemma4 is pure `modelopt_fp4` and Just Works.
 - **Hybrid Mamba models need two flags.** The 27B (and 35B) are hybrid attention +
   Mamba/SSM. `--max-num-seqs 2` is load-bearing: the SSM state cache is sized by
   max-num-seqs (×48 layers) and is *not* gated by `--gpu-memory-utilization`, so the
@@ -79,6 +95,7 @@ docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
 
 ```bash
 make                       # list targets
+make pull                  # refresh the vLLM image (docker won't re-pull on its own)
 make up-qwen3.6-27b        # load a model (downloads weights on first run)
 make logs                  # follow startup until "Application startup complete"
 make status                # loaded model id + GPU memory
@@ -110,11 +127,21 @@ OpenAI-compatible gateway or reverse proxy rather than exposing the port directl
   launch of each model/flag combo. KV-cache profiling still runs each boot.
 - **Max quality on the 27B** → swap the repo to `Qwen/Qwen3.6-27B-FP8` (8-bit,
   ~28 GB) for the absolute quality ceiling, at the cost of context (~32–64K).
-- **NVFP4 not auto-detected** → vLLM reads the format from `config.json`; do
-  **not** pass `--quantization`. Only if detection fails, add
-  `--quantization modelopt_fp4`.
+  The Unsloth quant already puts attention + lm_head in FP8, so the gap is
+  smaller than it was with pure FP4.
+- **More context on the 27B** → the old text-only pure-FP4 checkpoint
+  (`sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`, ~17.6 GB) reached **192K**; swap
+  it back if you need long context more than the Unsloth quant's quality/speed.
+- **Slow generation on the 27B** → check `make logs` for the speculative-decode
+  acceptance rate; the MTP draft head should accept most tokens. To disable
+  spec decode, remove `$(MTP_SPEC)` from the target.
+- **Quant not auto-detected** → vLLM reads the format from `config.json`; do
+  **not** pass `--quantization`. (Unsloth 27B = `compressed-tensors`, the others
+  = `modelopt_fp4`.) Also don't force an MoE backend — Unsloth reports a ~2.5x
+  regression when overriding vLLM's auto-selected (cute-DSL) backend.
 - **Blackwell image** → native sm_120 NVFP4 needs a current build. Use
-  `vllm/vllm-openai:cu130-nightly`; pin via `VLLM_IMAGE` in `.env`.
+  `vllm/vllm-openai:nightly` (the `cu130-nightly` tag is dead, see above); pin
+  via `VLLM_IMAGE` in `.env`, refresh with `make pull`.
 - **Save VRAM (text-only)** → `--language-model-only` (already on) skips the
   vision encoder; dropping it enables image input but costs context.
 

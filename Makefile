@@ -17,9 +17,11 @@
 #   make logs / status / health
 #
 # Image is pinned via VLLM_IMAGE in .env (default below). Native sm_120 NVFP4
-# needs a current build (>= the PRs that added ENABLE_NVFP4_SM120 /
-# ENABLE_CUTLASS_MOE_SM120): use cu130-nightly. Stable release tags are cu129
-# only and may lack the prebuilt sm_120 FP4 kernels. HF weights are shared from
+# needs a current build. BEWARE: the cu130-nightly tag upstream is DEAD (frozen
+# 2026-04-23) — the rolling tag is now plain "nightly", and `docker pull` must be
+# run explicitly (a locally cached tag is never re-pulled, so "nightly" rots
+# silently; symptom: brand-new quants fail weight loading, e.g. missing
+# lm_head.weight_scale). Run `make pull` to refresh. HF weights are shared from
 # the host cache (~/.cache/huggingface); the torch.compile cache is shared from
 # ~/.cache/vllm so cold starts don't recompile every launch.
 # Prereq: Docker + NVIDIA Container Toolkit (already set up on this box).
@@ -27,7 +29,7 @@
 SHELL      := /usr/bin/env bash
 PORT       := 8000
 NAME       := vllm-local
-IMAGE      := vllm/vllm-openai:cu130-nightly   # override with VLLM_IMAGE in .env
+IMAGE      := vllm/vllm-openai:nightly   # override with VLLM_IMAGE in .env
 HF_CACHE   := $(HOME)/.cache/huggingface
 VLLM_CACHE := $(HOME)/.cache/vllm
 ENV_FILE   := $(CURDIR)/.env
@@ -37,6 +39,10 @@ ENV_FILE   := $(CURDIR)/.env
 # --kv-cache-dtype fp8 ~doubles KV headroom (=> more context); prefix caching
 # reuses shared prompt prefixes across requests.
 SERVE_COMMON = --host 0.0.0.0 --port $(PORT) --kv-cache-dtype fp8 --enable-prefix-caching
+
+# MTP self-speculative decoding (draft head baked into the checkpoint).
+# Kept in a variable because the JSON commas would split $(call ...) arguments.
+MTP_SPEC := --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}'
 
 # $(call serve,<model>,<served-name>,<extra flags>)
 define serve
@@ -69,17 +75,26 @@ endef
 # gemma4 uses sliding-window attention (cheap KV) and should reach full 256K.
 
 .PHONY: up-qwen3.6-27b
-up-qwen3.6-27b: ## 27B hybrid Mamba — sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP (~15GB, text-only)
-	# NOT the nvidia/Qwen3.6-27B-NVFP4 checkpoint: that one keeps the vision tower +
-	# lm_head in BF16, and on this build it loads at ~30GB and OOMs on 32GB no matter
-	# the context/flags. This is the TEXT-ONLY NVFP4 sibling (vision stripped) — ~15GB,
-	# validated at 200K ctx on a single 5090. It is also hybrid (48/64 layers are
-	# Mamba SSM), so --max-num-batched-tokens 8192 is required (like the 35B).
-	# --language-model-only is still needed: the architecture is the multimodal
-	# Qwen3_5ForConditionalGeneration wrapper, so without it vLLM tries to load an
-	# image processor and fails (the checkpoint stripped the vision preprocessor).
-	# MTP head is present for optional spec decoding (add --speculative-config, ~1.7x).
-	$(call serve,sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP,qwen3.6-27b,--max-model-len 196608 --max-num-seqs 2 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 --reasoning-parser qwen3 --language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_xml)
+up-qwen3.6-27b: ## 27B hybrid Mamba — unsloth/Qwen3.6-27B-NVFP4 (~23GB, FP8 attn + NVFP4 MLP, MTP spec decode)
+	# Unsloth quant (2026-07-10): mixed compressed-tensors — attention + head in FP8,
+	# MLPs in NVFP4, calibrated with fp8 KV cache. Higher quality than the pure-FP4
+	# sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP checkpoint it replaced, but ~23GB
+	# loaded vs ~17.6GB, so max context drops from 192K. Unlike the nvidia/ mixed
+	# checkpoint (BF16 vision tower + lm_head, ~30GB, OOMs), this one quantizes the
+	# big pieces and fits. Vision tower is present but skipped
+	# (--language-model-only); drop that flag to enable image input at a context cost.
+	# Hybrid model (48/64 layers linear-attention/SSM): --max-num-seqs 2 and
+	# --max-num-batched-tokens 8192 remain load-bearing (see README).
+	# $(MTP_SPEC) enables the checkpoint's fixed MTP head as its own draft model
+	# (Unsloth-recommended, ~1.4-2.2x decode speedup); remove it if boot OOMs.
+	# util 0.94 is load-bearing: at 0.90 the measured per-request ceiling is only
+	# ~99K tokens; at 0.94 it is 137,600 (measured, nightly 2026-07-11 — don't
+	# trust the larger "GPU KV cache size" log line: on this hybrid model the
+	# Mamba state pages share that pool, so pool-tokens ≠ context). 131072 boots
+	# with 1.35x concurrency; 163840 does NOT fit. Needs the CURRENT "nightly"
+	# image — older builds fail loading with "no module or parameter named
+	# 'lm_head.weight_scale'" (quantized lm_head support is recent).
+	$(call serve,unsloth/Qwen3.6-27B-NVFP4,qwen3.6-27b,--max-model-len 131072 --max-num-seqs 2 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.94 --reasoning-parser qwen3 --language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_xml $(MTP_SPEC))
 
 # DROPPED — 35B hybrid attn+SSM MoE. The nvidia/Qwen3.6-35B-A3B-NVFP4 checkpoint
 # OOMs at ~30GB during init on this 32GB card, and is redundant next to the
@@ -102,6 +117,12 @@ up-gemma4-26b: ## 26B MoE — nvidia/Gemma-4-26B-A4B-NVFP4
 ## ----------------------------------------------------------------------------
 ## Lifecycle / observability
 ## ----------------------------------------------------------------------------
+
+.PHONY: pull
+pull: ## Refresh the vLLM image (docker never re-pulls a cached tag on its own)
+	@set -a; [ -f $(ENV_FILE) ] && . $(ENV_FILE); set +a; \
+	IMG=$${VLLM_IMAGE:-$(IMAGE)}; \
+	docker pull $$IMG && docker inspect $$IMG --format 'image built: {{.Created}}'
 
 .PHONY: down
 down: ## Stop + remove the running vLLM container (frees the GPU)
