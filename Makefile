@@ -84,7 +84,11 @@ up-qwen3.6-27b: ## 27B hybrid Mamba — unsloth/Qwen3.6-27B-NVFP4 (~23GB, FP8 at
 	# big pieces and fits. Vision tower is present but skipped
 	# (--language-model-only); drop that flag to enable image input at a context cost.
 	# Hybrid model (48/64 layers linear-attention/SSM): --max-num-seqs 2 and
-	# --max-num-batched-tokens 8192 remain load-bearing (see README).
+	# a --max-num-batched-tokens bound remain load-bearing (see README). 4096
+	# (down from 8192, 2026-07-14): 8192-token prefill chunks OOM'd mid-request
+	# at util 0.94 — the fp4_gemm fallback workspace for ~8K shapes isn't covered
+	# by startup profiling and the headroom is <300MB. Halving the chunk halves
+	# the activation spike; util 0.94 itself must not be lowered (context ceiling).
 	# $(MTP_SPEC) enables the checkpoint's fixed MTP head as its own draft model
 	# (Unsloth-recommended, ~1.4-2.2x decode speedup); remove it if boot OOMs.
 	# util 0.94 is load-bearing: at 0.90 the measured per-request ceiling is only
@@ -94,7 +98,7 @@ up-qwen3.6-27b: ## 27B hybrid Mamba — unsloth/Qwen3.6-27B-NVFP4 (~23GB, FP8 at
 	# with 1.35x concurrency; 163840 does NOT fit. Needs the CURRENT "nightly"
 	# image — older builds fail loading with "no module or parameter named
 	# 'lm_head.weight_scale'" (quantized lm_head support is recent).
-	$(call serve,unsloth/Qwen3.6-27B-NVFP4,qwen3.6-27b,--max-model-len 131072 --max-num-seqs 2 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.94 --reasoning-parser qwen3 --language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_xml $(MTP_SPEC))
+	$(call serve,unsloth/Qwen3.6-27B-NVFP4,qwen3.6-27b,--max-model-len 131072 --max-num-seqs 2 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.94 --reasoning-parser qwen3 --language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_xml $(MTP_SPEC))
 
 # DROPPED — 35B hybrid attn+SSM MoE. The nvidia/Qwen3.6-35B-A3B-NVFP4 checkpoint
 # OOMs at ~30GB during init on this 32GB card, and is redundant next to the
